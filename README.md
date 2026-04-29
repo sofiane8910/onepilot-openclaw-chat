@@ -100,7 +100,26 @@ The mobile-side reader is `ios/Sources/Onepilot/Models/Agent/Adapters/PluginMani
 
 ## Cutting a new version
 
-See `CLAUDE.md` in this directory (gitignored) for the release pipeline — the published tarball is built from a separate repo, and forgetting the sync step is a known footgun.
+Six steps. Skipping the sha256 re-fetch (#5) is the known footgun — GitHub re-uploads the asset on publish, so the digest you see while it's a draft does **not** match the published artifact.
+
+1. **Bump** `version` in `package.json`. Refresh anything that mirrors it (the contract test in `test/wrapper-api.test.js` reads it via `package.json`, so usually nothing else).
+2. **Commit + tag** in this repo: `git commit -am "Release vX.Y.Z" && git tag vX.Y.Z && git push --follow-tags`. Update the submodule pointer in `onepilotapp/` and push there too — the release CI in `onepilotapp` builds the tarball from that pointer.
+3. **Watch the release CI** (`gh run watch -R sofiane8910/onepilotapp`) cut a draft GitHub Release with the tarball attached as an asset.
+4. **Publish the draft**: `gh release edit "openclaw/onepilot-channel@vX.Y.Z" -R sofiane8910/onepilotapp --draft=false --latest=false`. Until this runs, the asset URL returns HTTP 404 and every iOS install fails fast.
+5. **Re-fetch the canonical sha256** from the published asset (GitHub may have repacked):
+   ```sh
+   curl -sL "https://github.com/sofiane8910/onepilotapp/releases/download/openclaw/onepilot-channel%40vX.Y.Z/onepilot-channel-vX.Y.Z.tgz" \
+     | shasum -a 256 | awk '{print $1}'
+   ```
+6. **Bump the manifest** in Supabase (one row, three columns):
+   ```sql
+   UPDATE public.plugin_manifest
+   SET version = 'vX.Y.Z',
+       tarball_url = 'https://github.com/sofiane8910/onepilotapp/releases/download/openclaw/onepilot-channel%40vX.Y.Z/onepilot-channel-vX.Y.Z.tgz',
+       sha256 = '<sha from step 5>'
+   WHERE channel = 'stable';
+   ```
+   Apply via `mcp__supabase_onepilot__execute_sql` (or the Supabase dashboard) — `service_role` is required because RLS denies DML to `anon`/`authenticated`. Existing agents pick up the new release on their next `ensureSyncSetup`; iOS doesn't need rebuilding.
 
 ## Rollback
 
