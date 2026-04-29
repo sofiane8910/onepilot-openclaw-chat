@@ -5,6 +5,31 @@ OpenClaw plugin that bridges the Onepilot app to the agent runtime. Two responsi
 1. **Inbound** — opens a durable channel to the Onepilot backend, listens for new user-message events, dispatches them into the agent loop via the gateway's local `/v1/chat/completions` endpoint, and POSTs the assistant reply back to the Onepilot backend so the app receives it via push. Survives mobile force-quits because the agent loop never depends on the app staying alive.
 2. **Outbound channel** — registers `onepilot` as a real OpenClaw channel (`api.registerChannel`). This is what makes cron jobs (and any other agent-driven outbound delivery) work — without a registered channel, OpenClaw's delivery resolver throws `"channel is required"` at fire-time. The channel's `sendText` reuses the same backend message endpoint the inbound reply flow uses.
 
+## Design principles
+
+These rules govern every change to this plugin. They exist because the app ships through App Store review (1–2 week turnaround) but the plugin ships through `plugin_manifest` (instant). When the boundary between them blurs, every framework rename or schema tweak becomes a stuck App Store release. Don't blur the boundary.
+
+**1. Plugins are the heavy lifters.** Anything that touches the framework — flag spelling, config-key paths, CLI shape, plugin install/uninstall, account write-back — lives **here**, not in iOS. If OpenClaw renames `--strict-json` tomorrow, this plugin absorbs it and ships v+1 via `plugin_manifest`; the app doesn't notice. New iOS adapter code calling `openclaw <verb>` directly is a regression — route it through the wrapper API in `src/wrapper-api.js` and let the plugin shell out.
+
+**2. The app renders what we control.** iOS speaks to two surfaces only: this plugin's `/onepilot/v1/*` HTTP wrapper and the chat WebSocket. Both shapes are owned by us, both are versioned, both have contract tests. UI gates on capability flags (`AgentFrameworkCapability`), never on `frameworkType == .openclaw`. New features land as new wrapper endpoints with stable verbs — not as new framework-CLI invocations from Swift. If the app needs to render something the plugin doesn't expose yet, add the endpoint here first.
+
+**3. Security first.** A leaked agent key (`oak_*`) must read zero rows outside its bound `(user_id, agent_profile_id)`, and writes must be attributed only to that pair — server-side, not from request body. Every wrapper endpoint takes `Authorization: Bearer <agentKey>`, binds on `127.0.0.1` only, and never accepts user-supplied `userId`/`agentProfileId` overrides. New edge-function calls require a `SCOPE.md` documenting the authz scope. New imports (`child_process`, `eval`, `Function(`, dynamic require) need explicit justification — the in-process plugin model means anything we import has full gateway access. Residual risks are tracked in the parent repo's `SECURITY_AUDIT.md`; if you discover a new one, add an entry there before merging.
+
+**4. This repo is public — write for strangers, not insiders.** The plugin source ships to GitHub and runs on every user's host. Treat every comment, log line, error string, and identifier as user-readable.
+
+- No backend architecture leaks: don't reference internal vendor names, project IDs, internal table names beyond what an endpoint already exposes, dashboard URLs, deploy hostnames, or service-internal tooling. Generic terms (`backend`, `auth provider`, `realtime channel`) over branded ones.
+- No verbose internal commentary. Comments explain **why** a non-obvious thing is the way it is, not what the code does. No multi-paragraph docstrings, no walls of context that only make sense to someone on the team. If a reader needs three paragraphs to understand a function, the code is wrong, not the comments.
+- No JIRA / Linear / PR / incident references in code. They rot, and they leak our process. Put that context in the commit message, where it belongs.
+- No hardcoded internal URLs or staging hostnames. All endpoints come from `account.backendUrl` / `account.streamUrl` at runtime.
+- Log lines are user-facing too — they end up in `journalctl` or the user's terminal. No stack-trace dumps with internal paths, no PII, no full bearer tokens (prefix-only is fine for diagnostics).
+- Error messages exposed via the wrapper API are bounded (`.slice(0, 200)`, `[:200]`) for the same reason — bound the leak surface.
+
+**Practical contract:**
+
+- Bump `package.json` version + refresh the bundled Swift snapshot (`OpenClawOnepilotPlugin.swift`) in the same PR.
+- New `/onepilot/v1/*` endpoint → contract test in `test/wrapper-api.test.js` + matching method in `OnepilotPluginClient.swift` in the app repo.
+- Bootstrap commands (the very first `npm install`, the very first `plugins install --link`, the very first `gateway run`) are exempt — by definition the wrapper API doesn't exist yet.
+
 ## Repository layout
 
 ```
