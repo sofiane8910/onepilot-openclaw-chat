@@ -5,6 +5,18 @@ import { broadcast, progressUpsert, progressClear } from "./progress.js";
 
 const HISTORY_LIMIT = 20;
 
+// Heartbeat thresholds for silent-think models. iOS marks a session
+// "stalled" after ~25s of broadcast silence (AgentChatViewModel
+// stallThresholdSeconds). When the openclaw runtime is firing events
+// for our session but none of them are tool/thinking (e.g. a long
+// pre-tool plan, or assistant-stream-only models), we keep the iOS
+// heartbeat warm by broadcasting an empty `reasoning_delta` — iOS's
+// extendReplyDeadline() runs before its empty-text guard
+// (AgentChatViewModel.swift:321), so trail rendering is unchanged.
+const HEARTBEAT_CHECK_INTERVAL_MS = 5_000;
+const HEARTBEAT_BROADCAST_AFTER_MS = 18_000;
+const HEARTBEAT_LIVENESS_WINDOW_MS = 20_000;
+
 /**
  * @param {{
  *   api: any,
@@ -112,11 +124,19 @@ export async function handleUserMessage(params) {
   };
   // Single end-of-turn diagnostic line — kept because it's the cheapest
   // way to tell whether the listener still works if streaming regresses.
-  const counters = { received: 0, tool: 0, thinking: 0, other: 0 };
+  const counters = { received: 0, tool: 0, thinking: 0, other: 0, heartbeat: 0 };
+  // Liveness tracking. `lastAgentEventAt` proves the openclaw runtime is
+  // still producing output for our turn (tool, thinking, OR assistant /
+  // lifecycle / context — anything with our sessionKey). `lastBroadcastAt`
+  // tracks when iOS last received something from us — the value the
+  // heartbeat keeps fresh so iOS's stall flag doesn't false-positive.
+  let lastAgentEventAt = Date.now();
+  let lastBroadcastAt = Date.now();
   const unsubscribe = typeof subscribe === "function"
     ? subscribe((evt) => {
         if (!evt || evt.sessionKey !== peerSessionKey) return;
         counters.received++;
+        lastAgentEventAt = Date.now();
         if (evt.stream === "thinking") {
           counters.thinking++;
           const data = evt.data ?? {};
@@ -125,6 +145,7 @@ export async function handleUserMessage(params) {
             : (typeof data.text === "string" ? data.text : "");
           if (!text) return;
           void broadcast(account, sessionId, "reasoning_delta", { text }, progressLog);
+          lastBroadcastAt = Date.now();
           void appendTrail(text);
         } else if (evt.stream === "tool") {
           counters.tool++;
@@ -141,6 +162,7 @@ export async function handleUserMessage(params) {
             ? data.label
             : buildToolLabel(name, data.args);
           void broadcast(account, sessionId, "tool_progress", { tool: name, emoji, label }, progressLog);
+          lastBroadcastAt = Date.now();
           void appendTrail(`${emoji} ${label}\n`);
         } else {
           counters.other++;
@@ -149,6 +171,25 @@ export async function handleUserMessage(params) {
     : () => {};
 
   await broadcast(account, sessionId, "started", {}, progressLog);
+  lastBroadcastAt = Date.now();
+
+  // Heartbeat: when the agent is alive (lastAgentEventAt is recent) but
+  // we haven't broadcast anything to iOS in a while, fire an empty
+  // reasoning_delta so iOS's extendReplyDeadline() resets and the spinner
+  // doesn't false-positive into the stalled state. Event-driven: if the
+  // gateway truly hangs, lastAgentEventAt freezes and the heartbeat goes
+  // silent — iOS's 25s stall flag still fires for genuine hangs.
+  const heartbeatTimer = setInterval(() => {
+    const now = Date.now();
+    const agentAlive = now - lastAgentEventAt < HEARTBEAT_LIVENESS_WINDOW_MS;
+    const broadcastStale = now - lastBroadcastAt > HEARTBEAT_BROADCAST_AFTER_MS;
+    if (agentAlive && broadcastStale) {
+      counters.heartbeat++;
+      lastBroadcastAt = now;
+      void broadcast(account, sessionId, "reasoning_delta", { text: "" }, progressLog);
+    }
+  }, HEARTBEAT_CHECK_INTERVAL_MS);
+  heartbeatTimer.unref?.();
 
   // Wrap the entire turn so the in-process listener is always torn down and
   // the agent_session_progress row is always cleared, regardless of success
@@ -158,7 +199,8 @@ export async function handleUserMessage(params) {
     if (cleanedUp) return;
     cleanedUp = true;
     try { unsubscribe(); } catch { /* noop */ }
-    log(`[turn] received=${counters.received} tool=${counters.tool} thinking=${counters.thinking} other=${counters.other} trail=${trail.text.length}b`);
+    clearInterval(heartbeatTimer);
+    log(`[turn] received=${counters.received} tool=${counters.tool} thinking=${counters.thinking} other=${counters.other} heartbeat=${counters.heartbeat} trail=${trail.text.length}b`);
     if (kind === "error") {
       await broadcast(account, sessionId, "error", { message: errMessage ?? "" }, progressLog);
     } else {
