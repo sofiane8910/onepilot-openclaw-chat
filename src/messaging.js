@@ -139,10 +139,30 @@ export async function handleUserMessage(params) {
     }
       })
     : () => {};
-  // Surface counters at the end of the turn so a single glance at the gateway
-  // log answers "did the plugin see any events for this message?".
+  // Surface counters at the end of the turn — both in the gateway log AND as
+  // a broadcast event so the iOS app's broadcast log shows them next to the
+  // existing `started`/`done` lines, no host SSH required to debug a
+  // zero-event session.
+  const sampleSessionKey = (() => {
+    for (const k of seenSessionKeys) return k;
+    return null;
+  })();
   const logCotSummary = () => {
-    log(`[cot] summary received=${counters.received} matched=${counters.matched} thinking=${counters.thinking} tool=${counters.tool} other=${counters.other} dropped=${counters.dropped} trail=${trail.text.length}b`);
+    log(`[cot] summary received=${counters.received} matched=${counters.matched} thinking=${counters.thinking} tool=${counters.tool} other=${counters.other} dropped=${counters.dropped} subscribe=${typeof subscribe === "function"} trail=${trail.text.length}b sample-key=${sampleSessionKey ?? "<none>"}`);
+  };
+  const broadcastCotDiag = async () => {
+    await broadcast(account, sessionId, "cot_diag", {
+      subscribe_available: typeof subscribe === "function",
+      received: counters.received,
+      matched: counters.matched,
+      thinking: counters.thinking,
+      tool: counters.tool,
+      other: counters.other,
+      dropped: counters.dropped,
+      trail_bytes: trail.text.length,
+      expected_session_key: peerSessionKey,
+      sample_dropped_session_key: sampleSessionKey,
+    }, progressLog);
   };
 
   await broadcast(account, sessionId, "started", {}, progressLog);
@@ -156,6 +176,7 @@ export async function handleUserMessage(params) {
     cleanedUp = true;
     try { unsubscribe(); } catch { /* noop */ }
     logCotSummary();
+    await broadcastCotDiag();
     if (kind === "error") {
       await broadcast(account, sessionId, "error", { message: errMessage ?? "" }, progressLog);
     } else {
