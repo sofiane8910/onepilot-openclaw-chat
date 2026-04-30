@@ -150,20 +150,18 @@ export async function handleUserMessage(params) {
   const logCotSummary = () => {
     log(`[cot] summary received=${counters.received} matched=${counters.matched} thinking=${counters.thinking} tool=${counters.tool} other=${counters.other} dropped=${counters.dropped} subscribe=${typeof subscribe === "function"} trail=${trail.text.length}b sample-key=${sampleSessionKey ?? "<none>"}`);
   };
-  const broadcastCotDiag = async () => {
-    await broadcast(account, sessionId, "cot_diag", {
-      subscribe_available: typeof subscribe === "function",
-      received: counters.received,
-      matched: counters.matched,
-      thinking: counters.thinking,
-      tool: counters.tool,
-      other: counters.other,
-      dropped: counters.dropped,
-      trail_bytes: trail.text.length,
-      expected_session_key: peerSessionKey,
-      sample_dropped_session_key: sampleSessionKey,
-    }, progressLog);
-  };
+  const cotDiagPayload = () => ({
+    cot_subscribe_available: typeof subscribe === "function",
+    cot_received: counters.received,
+    cot_matched: counters.matched,
+    cot_thinking: counters.thinking,
+    cot_tool: counters.tool,
+    cot_other: counters.other,
+    cot_dropped: counters.dropped,
+    cot_trail_bytes: trail.text.length,
+    cot_expected_session_key: peerSessionKey,
+    cot_sample_dropped_session_key: sampleSessionKey ?? "",
+  });
 
   await broadcast(account, sessionId, "started", {}, progressLog);
 
@@ -176,11 +174,16 @@ export async function handleUserMessage(params) {
     cleanedUp = true;
     try { unsubscribe(); } catch { /* noop */ }
     logCotSummary();
-    await broadcastCotDiag();
+    // Inline the counters into done/error payloads — iOS only subscribes to
+    // a fixed list of event names (RealtimeMessageListener), so a separate
+    // `cot_diag` event never reaches the app. The chat VM's done/error
+    // handlers ignore unknown keys; flatten() surfaces them in the broadcast
+    // log so they're visible without host-side SSH.
+    const diag = cotDiagPayload();
     if (kind === "error") {
-      await broadcast(account, sessionId, "error", { message: errMessage ?? "" }, progressLog);
+      await broadcast(account, sessionId, "error", { message: errMessage ?? "", ...diag }, progressLog);
     } else {
-      await broadcast(account, sessionId, "done", {}, progressLog);
+      await broadcast(account, sessionId, "done", diag, progressLog);
     }
     await progressClear(account, sessionId, progressLog);
   };
