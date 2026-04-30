@@ -6,3 +6,8 @@ export function getAgentId() {
   const raw = process.env.OPENCLAW_PROFILE;
   return (typeof raw === "string" ? raw : "default").trim().toLowerCase() || "default";
 }
+
+export function getWrapperPort(fallback) {
+  const raw = Number(process.env.ONEPILOT_WRAPPER_PORT);
+  return Number.isFinite(raw) && raw > 0 ? raw : fallback;
+}

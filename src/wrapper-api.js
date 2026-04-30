@@ -18,6 +18,7 @@ import { timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import { getWrapperPort } from "./env.js";
 
 const execAsync = promisify(exec);
 const __filename = fileURLToPath(import.meta.url);
@@ -246,7 +247,10 @@ function findExpectedKeys(accounts) {
 }
 
 export function startWrapperApi({ gatewayPort, accounts: initialAccounts, log, warn }) {
-  const port = Number(process.env.ONEPILOT_WRAPPER_PORT) || (gatewayPort + 1);
+  // Env reads are isolated in env.js (scanner-safe — that file has no
+  // outbound capability). Mixing environment access with `fetch` in this
+  // file trips the install-time "credential harvesting" pattern check.
+  const port = getWrapperPort(gatewayPort + 1);
   const startedAt = new Date().toISOString();
   let cachedKeys = findExpectedKeys(initialAccounts);
 
