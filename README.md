@@ -26,7 +26,8 @@ These rules govern every change to this plugin. They exist because the app ships
 
 **Practical contract:**
 
-- Bump `package.json` version + refresh the bundled Swift snapshot (`OpenClawOnepilotPlugin.swift`) in the same PR.
+- **Push == release.** Every `git push origin main` here must be paired with a fresh GitHub release **and** a `plugin_manifest` UPDATE in Supabase pinning the new version, URL, and sha256. Anything less leaves users on a stale pin while `main` claims a newer state. Follow the full 6-step runbook in [Cutting a new version](#cutting-a-new-version) — no shortcuts. The iOS app trusts the manifest, not `main`.
+- Bump `package.json` version in the same PR as any user-visible change.
 - New `/onepilot/v1/*` endpoint → contract test in `test/wrapper-api.test.js` + matching method in `OnepilotPluginClient.swift` in the app repo.
 - Bootstrap commands (the very first `npm install`, the very first `plugins install --link`, the very first `gateway run`) are exempt — by definition the wrapper API doesn't exist yet.
 

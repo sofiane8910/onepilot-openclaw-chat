@@ -1,0 +1,10 @@
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log
+*.log
+.DS_Store
+
+# Internal contributor notes (best-practices doc, not for public eyes)
+CLAUDE.md
