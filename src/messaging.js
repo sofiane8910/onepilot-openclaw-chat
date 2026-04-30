@@ -95,9 +95,38 @@ export async function handleUserMessage(params) {
   // Diagnostic counters — logged at done/error so we can tell at a glance
   // whether events are arriving at all, whether the sessionKey filter is
   // dropping them, and whether the broadcast path is firing.
-  const counters = { received: 0, matched: 0, thinking: 0, tool: 0, other: 0, dropped: 0 };
+  const counters = { received: 0, matched: 0, thinking: 0, tool: 0, other: 0, dropped: 0, tool_starts: 0 };
   // Sample a few unmatched session keys so we can see if the filter is wrong.
   const seenSessionKeys = new Set();
+  // Sample the first occurrence of each non-tool/thinking stream so we can
+  // see what's in the "other" bucket without flooding the gateway log.
+  const seenOtherStreams = new Map();
+  // Build a verbose, useful label out of a tool's args so iOS shows
+  // `exec ls -la /etc` instead of just `exec`. Bounded so a giant arg
+  // string can't blow up the broadcast payload.
+  const buildToolLabel = (name, args) => {
+    if (!args || typeof args !== "object") return name;
+    const pickFirst = (...keys) => {
+      for (const k of keys) {
+        const v = args[k];
+        if (typeof v === "string" && v.trim()) return v.trim();
+        if (typeof v === "number") return String(v);
+      }
+      return null;
+    };
+    const detail = pickFirst(
+      "cmd", "command", "shell", // exec/process/shell tools
+      "url", "href",              // web_fetch / web_search
+      "path", "filepath", "file", "filename", // file ops
+      "query", "q",               // search
+      "pattern",                  // grep/glob
+      "to", "channel",            // messaging
+      "name",                     // generic
+    );
+    if (!detail) return name;
+    const trimmed = detail.length > 80 ? detail.slice(0, 80) + "…" : detail;
+    return `${name} ${trimmed}`;
+  };
   const unsubscribe = typeof subscribe === "function"
     ? subscribe((evt) => {
     if (!evt) return;
@@ -130,14 +159,34 @@ export async function handleUserMessage(params) {
     } else if (evt.stream === "tool") {
       counters.tool++;
       const data = evt.data ?? {};
-      const tool = typeof data.tool === "string" ? data.tool : (typeof data.name === "string" ? data.name : "tool");
+      // OpenClaw fires tool events at three phases: start / update / end.
+      // We only broadcast on `start` so iOS shows one row per actual tool
+      // invocation, not three. The other phases still increment the
+      // counter for diagnostics.
+      if (data.phase && data.phase !== "start") return;
+      counters.tool_starts++;
+      const name = typeof data.name === "string"
+        ? data.name
+        : (typeof data.tool === "string" ? data.tool : "tool");
       const emoji = typeof data.emoji === "string" ? data.emoji : "→";
-      const label = typeof data.label === "string" ? data.label : tool;
-      log(`[cot] tool event matched tool=${tool} label=${label.slice(0, 40)}`);
-      void broadcast(account, sessionId, "tool_progress", { tool, emoji, label }, progressLog);
+      // Prefer an explicit upstream label, otherwise derive a verbose one
+      // from args so iOS shows `exec ls -la` instead of bare `exec`.
+      const label = typeof data.label === "string" && data.label
+        ? data.label
+        : buildToolLabel(name, data.args);
+      log(`[cot] tool start name=${name} label=${label.slice(0, 80)}`);
+      void broadcast(account, sessionId, "tool_progress", { tool: name, emoji, label }, progressLog);
       void appendTrail(`${emoji} ${label}\n`);
     } else {
       counters.other++;
+      // Capture one sample per distinct non-tool/thinking stream so we can
+      // tell what's in there (likely `assistant` deltas — but worth
+      // confirming on each runtime version).
+      if (evt.stream && !seenOtherStreams.has(evt.stream)) {
+        const data = evt.data ?? {};
+        seenOtherStreams.set(evt.stream, Object.keys(data).join(","));
+        log(`[cot] other stream=${evt.stream} dataKeys=${seenOtherStreams.get(evt.stream)}`);
+      }
     }
       })
     : () => {};
@@ -152,18 +201,29 @@ export async function handleUserMessage(params) {
   const logCotSummary = () => {
     log(`[cot] summary received=${counters.received} matched=${counters.matched} thinking=${counters.thinking} tool=${counters.tool} other=${counters.other} dropped=${counters.dropped} subscribe=${typeof subscribe === "function"} trail=${trail.text.length}b sample-key=${sampleSessionKey ?? "<none>"}`);
   };
-  const cotDiagPayload = () => ({
-    cot_subscribe_available: typeof subscribe === "function",
-    cot_received: counters.received,
-    cot_matched: counters.matched,
-    cot_thinking: counters.thinking,
-    cot_tool: counters.tool,
-    cot_other: counters.other,
-    cot_dropped: counters.dropped,
-    cot_trail_bytes: trail.text.length,
-    cot_expected_session_key: peerSessionKey,
-    cot_sample_dropped_session_key: sampleSessionKey ?? "",
-  });
+  const cotDiagPayload = () => {
+    // Build a `stream=keys|stream=keys` summary of the first few unique
+    // non-tool/thinking streams we saw. Bounded length for the broadcast.
+    const otherStreamsList = [];
+    for (const [stream, keys] of seenOtherStreams) {
+      otherStreamsList.push(`${stream}=${keys}`);
+      if (otherStreamsList.length >= 3) break;
+    }
+    return {
+      cot_subscribe_available: typeof subscribe === "function",
+      cot_received: counters.received,
+      cot_matched: counters.matched,
+      cot_thinking: counters.thinking,
+      cot_tool: counters.tool,
+      cot_tool_starts: counters.tool_starts,
+      cot_other: counters.other,
+      cot_other_streams: otherStreamsList.join("|"),
+      cot_dropped: counters.dropped,
+      cot_trail_bytes: trail.text.length,
+      cot_expected_session_key: peerSessionKey,
+      cot_sample_dropped_session_key: sampleSessionKey ?? "",
+    };
+  };
 
   await broadcast(account, sessionId, "started", {}, progressLog);
 
