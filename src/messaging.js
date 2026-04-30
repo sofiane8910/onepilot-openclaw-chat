@@ -89,29 +89,61 @@ export async function handleUserMessage(params) {
   // needed — if a future OpenClaw drops this seam the plugin no-ops the
   // listener and falls back to delivering only the final reply.
   const subscribe = api?.events?.onAgentEvent;
+  log(`[cot] subscribe-available=${typeof subscribe === "function"} peerSessionKey=${peerSessionKey} session=${String(sessionId).slice(0, 8)}`);
+  // Diagnostic counters — logged at done/error so we can tell at a glance
+  // whether events are arriving at all, whether the sessionKey filter is
+  // dropping them, and whether the broadcast path is firing.
+  const counters = { received: 0, matched: 0, thinking: 0, tool: 0, other: 0, dropped: 0 };
+  // Sample a few unmatched session keys so we can see if the filter is wrong.
+  const seenSessionKeys = new Set();
   const unsubscribe = typeof subscribe === "function"
     ? subscribe((evt) => {
-    // Filter to this user's turn. emitAgentEvent enriches every payload with
-    // sessionKey when the run context has one registered.
-    if (!evt || evt.sessionKey !== peerSessionKey) return;
+    if (!evt) return;
+    counters.received++;
+    if (counters.received <= 5) {
+      // Bounded: only log the first few to keep noise down on long runs.
+      log(`[cot] evt #${counters.received} stream=${evt.stream} runId=${String(evt.runId ?? "").slice(0, 8)} sessionKey=${evt.sessionKey ?? "<none>"} dataKeys=${Object.keys(evt.data ?? {}).join(",")}`);
+    }
+    if (evt.sessionKey !== peerSessionKey) {
+      counters.dropped++;
+      if (evt.sessionKey && seenSessionKeys.size < 5 && !seenSessionKeys.has(evt.sessionKey)) {
+        seenSessionKeys.add(evt.sessionKey);
+        log(`[cot] dropped event with non-matching sessionKey=${evt.sessionKey} (expected=${peerSessionKey})`);
+      }
+      return;
+    }
+    counters.matched++;
     if (evt.stream === "thinking") {
+      counters.thinking++;
       const data = evt.data ?? {};
       const text = typeof data.delta === "string" && data.delta
         ? data.delta
         : (typeof data.text === "string" ? data.text : "");
-      if (!text) return;
+      if (!text) {
+        log(`[cot] thinking event matched but no text/delta — keys=${Object.keys(data).join(",")}`);
+        return;
+      }
       void broadcast(account, sessionId, "reasoning_delta", { text }, progressLog);
       void appendTrail(text);
     } else if (evt.stream === "tool") {
+      counters.tool++;
       const data = evt.data ?? {};
       const tool = typeof data.tool === "string" ? data.tool : (typeof data.name === "string" ? data.name : "tool");
       const emoji = typeof data.emoji === "string" ? data.emoji : "→";
       const label = typeof data.label === "string" ? data.label : tool;
+      log(`[cot] tool event matched tool=${tool} label=${label.slice(0, 40)}`);
       void broadcast(account, sessionId, "tool_progress", { tool, emoji, label }, progressLog);
       void appendTrail(`${emoji} ${label}\n`);
+    } else {
+      counters.other++;
     }
       })
     : () => {};
+  // Surface counters at the end of the turn so a single glance at the gateway
+  // log answers "did the plugin see any events for this message?".
+  const logCotSummary = () => {
+    log(`[cot] summary received=${counters.received} matched=${counters.matched} thinking=${counters.thinking} tool=${counters.tool} other=${counters.other} dropped=${counters.dropped} trail=${trail.text.length}b`);
+  };
 
   await broadcast(account, sessionId, "started", {}, progressLog);
 
@@ -123,6 +155,7 @@ export async function handleUserMessage(params) {
     if (cleanedUp) return;
     cleanedUp = true;
     try { unsubscribe(); } catch { /* noop */ }
+    logCotSummary();
     if (kind === "error") {
       await broadcast(account, sessionId, "error", { message: errMessage ?? "" }, progressLog);
     } else {
