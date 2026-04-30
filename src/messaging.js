@@ -1,6 +1,7 @@
 // Run a user message through the gateway, deliver the reply via the backend.
 
 import { getAgentId } from "./env.js";
+import { broadcast, progressUpsert, progressClear } from "./progress.js";
 
 const HISTORY_LIMIT = 20;
 
@@ -65,87 +66,159 @@ export async function handleUserMessage(params) {
   const agentId = getAgentId();
   const peerId = String(account.userId).trim().toLowerCase();
   const peerSessionKey = `agent:${agentId}:onepilot:direct:${peerId}`;
-  // stream:true keeps the connection alive across long thinks even though
-  // we accumulate the whole reply locally and POST once at end-of-stream.
-  let reply;
-  try {
-    const res = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${gatewayToken}`,
-        "x-openclaw-message-channel": "onepilot",
-        "x-openclaw-account-id": accountId,
-        "x-openclaw-message-to": userMessageRow.session_key ?? account.sessionKey,
-        "x-openclaw-session-key": peerSessionKey,
-        "Accept": "text/event-stream",
-      },
-      body: JSON.stringify({
-        model: "openclaw",
-        messages,
-        stream: true,
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      log(`gateway /v1/chat/completions returned ${res.status}: ${body.slice(0, 200)}`);
-      return;
-    }
-    reply = await readSseAssistantText(res, log);
-  } catch (err) {
-    log(`gateway call failed`, err);
-    return;
-  }
 
-  if (!reply) {
-    log(`gateway returned no assistant text`);
-    return;
-  }
+  // --- Live progress fan-out (mirrors Hermes) -------------------------------
+  // Subscribe to in-process agent events for this turn and forward
+  // reasoning/tool deltas to Supabase Realtime so the iOS chat UI can render
+  // a chain-of-thought trail. Best-effort: a broadcast or upsert failure must
+  // not block the canonical assistant ingest path.
+  const userIdLc = String(account.userId).toLowerCase();
+  const agentProfileIdLc = String(account.agentProfileId).toLowerCase();
+  const trail = { text: "" };
+  const progressLog = (m, err) => {
+    if (err) log(`[progress] ${m}: ${String(err)}`);
+    else log(`[progress] ${m}`);
+  };
+  const appendTrail = async (line) => {
+    if (!line || trail.text.endsWith(line)) return;
+    trail.text += line;
+    await progressUpsert(account, sessionId, userIdLc, agentProfileIdLc, trail.text, progressLog);
+  };
+  // OpenClaw exposes the in-process agent-event bus to plugins through
+  // `api.events.onAgentEvent` (PluginRuntimeCore.events). No upstream change
+  // needed — if a future OpenClaw drops this seam the plugin no-ops the
+  // listener and falls back to delivering only the final reply.
+  const subscribe = api?.events?.onAgentEvent;
+  const unsubscribe = typeof subscribe === "function"
+    ? subscribe((evt) => {
+    // Filter to this user's turn. emitAgentEvent enriches every payload with
+    // sessionKey when the run context has one registered.
+    if (!evt || evt.sessionKey !== peerSessionKey) return;
+    if (evt.stream === "thinking") {
+      const data = evt.data ?? {};
+      const text = typeof data.delta === "string" && data.delta
+        ? data.delta
+        : (typeof data.text === "string" ? data.text : "");
+      if (!text) return;
+      void broadcast(account, sessionId, "reasoning_delta", { text }, progressLog);
+      void appendTrail(text);
+    } else if (evt.stream === "tool") {
+      const data = evt.data ?? {};
+      const tool = typeof data.tool === "string" ? data.tool : (typeof data.name === "string" ? data.name : "tool");
+      const emoji = typeof data.emoji === "string" ? data.emoji : "→";
+      const label = typeof data.label === "string" ? data.label : tool;
+      void broadcast(account, sessionId, "tool_progress", { tool, emoji, label }, progressLog);
+      void appendTrail(`${emoji} ${label}\n`);
+    }
+      })
+    : () => {};
+
+  await broadcast(account, sessionId, "started", {}, progressLog);
+
+  // Wrap the entire turn so the in-process listener is always torn down and
+  // the agent_session_progress row is always cleared, regardless of success
+  // path, error path, or early return.
+  let cleanedUp = false;
+  const finalize = async (kind, errMessage) => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    try { unsubscribe(); } catch { /* noop */ }
+    if (kind === "error") {
+      await broadcast(account, sessionId, "error", { message: errMessage ?? "" }, progressLog);
+    } else {
+      await broadcast(account, sessionId, "done", {}, progressLog);
+    }
+    await progressClear(account, sessionId, progressLog);
+  };
 
   try {
-    const userIdLc = String(account.userId).toLowerCase();
-    const agentProfileIdLc = String(account.agentProfileId).toLowerCase();
-    const url = `${account.backendUrl}/functions/v1/agent-message-ingest`;
-    const deliverBody = JSON.stringify({
-      userId: userIdLc,
-      agentProfileId: agentProfileIdLc,
-      sessionKey: userMessageRow.session_key ?? account.sessionKey,
-      role: "assistant",
-      content: [{ type: "text", text: reply }],
-      timestamp: Date.now(),
-    });
-    const deliverRes = await postIngestWithRetry(url, account.agentKey, deliverBody, log);
-    if (!deliverRes.ok) {
-      const body = await deliverRes.text();
-      log(`message POST returned ${deliverRes.status} after retries: ${body.slice(0, 200)} — sending user-visible fallback`);
-      await sendDeliveryFailureNotice({
-        url,
-        agentKey: account.agentKey,
-        userIdLc,
-        agentProfileIdLc,
-        sessionKey: userMessageRow.session_key ?? account.sessionKey,
-        log,
-      });
-      return;
-    }
-    log(`assistant reply delivered (${reply.length} chars)`);
-  } catch (err) {
-    log(`message POST failed`, err);
+    // stream:true keeps the connection alive across long thinks even though
+    // we accumulate the whole reply locally and POST once at end-of-stream.
+    let reply;
     try {
-      const userIdLc = String(account.userId).toLowerCase();
-      const agentProfileIdLc = String(account.agentProfileId).toLowerCase();
-      const url = `${account.backendUrl}/functions/v1/agent-message-ingest`;
-      await sendDeliveryFailureNotice({
-        url,
-        agentKey: account.agentKey,
-        userIdLc,
-        agentProfileIdLc,
-        sessionKey: userMessageRow.session_key ?? account.sessionKey,
-        log,
+      const res = await fetch(`http://127.0.0.1:${gatewayPort}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${gatewayToken}`,
+          "x-openclaw-message-channel": "onepilot",
+          "x-openclaw-account-id": accountId,
+          "x-openclaw-message-to": userMessageRow.session_key ?? account.sessionKey,
+          "x-openclaw-session-key": peerSessionKey,
+          "Accept": "text/event-stream",
+        },
+        body: JSON.stringify({
+          model: "openclaw",
+          messages,
+          stream: true,
+        }),
       });
-    } catch (notifyErr) {
-      log(`fallback notice also failed`, notifyErr);
+      if (!res.ok) {
+        const body = await res.text();
+        const errMsg = `gateway /v1/chat/completions returned ${res.status}: ${body.slice(0, 200)}`;
+        log(errMsg);
+        await finalize("error", errMsg);
+        return;
+      }
+      reply = await readSseAssistantText(res, log);
+    } catch (err) {
+      log(`gateway call failed`, err);
+      await finalize("error", `gateway call failed: ${String(err?.message ?? err)}`);
+      return;
     }
+
+    if (!reply) {
+      log(`gateway returned no assistant text`);
+      await finalize("error", "gateway returned no assistant text");
+      return;
+    }
+
+    try {
+      const url = `${account.backendUrl}/functions/v1/agent-message-ingest`;
+      const deliverBody = JSON.stringify({
+        userId: userIdLc,
+        agentProfileId: agentProfileIdLc,
+        sessionKey: userMessageRow.session_key ?? account.sessionKey,
+        role: "assistant",
+        content: [{ type: "text", text: reply }],
+        timestamp: Date.now(),
+      });
+      const deliverRes = await postIngestWithRetry(url, account.agentKey, deliverBody, log);
+      if (!deliverRes.ok) {
+        const body = await deliverRes.text();
+        log(`message POST returned ${deliverRes.status} after retries: ${body.slice(0, 200)} — sending user-visible fallback`);
+        await sendDeliveryFailureNotice({
+          url,
+          agentKey: account.agentKey,
+          userIdLc,
+          agentProfileIdLc,
+          sessionKey: userMessageRow.session_key ?? account.sessionKey,
+          log,
+        });
+        return;
+      }
+      log(`assistant reply delivered (${reply.length} chars)`);
+    } catch (err) {
+      log(`message POST failed`, err);
+      try {
+        const url = `${account.backendUrl}/functions/v1/agent-message-ingest`;
+        await sendDeliveryFailureNotice({
+          url,
+          agentKey: account.agentKey,
+          userIdLc,
+          agentProfileIdLc,
+          sessionKey: userMessageRow.session_key ?? account.sessionKey,
+          log,
+        });
+      } catch (notifyErr) {
+        log(`fallback notice also failed`, notifyErr);
+      }
+    }
+  } finally {
+    // Successful path or any other early return lands here as `done`. The
+    // error paths above call finalize("error", …) explicitly before returning,
+    // so cleanedUp is already true and this falls through.
+    await finalize("done");
   }
 }
 
