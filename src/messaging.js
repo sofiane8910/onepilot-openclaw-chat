@@ -85,10 +85,12 @@ export async function handleUserMessage(params) {
     await progressUpsert(account, sessionId, userIdLc, agentProfileIdLc, trail.text, progressLog);
   };
   // OpenClaw exposes the in-process agent-event bus to plugins through
-  // `api.events.onAgentEvent` (PluginRuntimeCore.events). No upstream change
-  // needed — if a future OpenClaw drops this seam the plugin no-ops the
-  // listener and falls back to delivering only the final reply.
-  const subscribe = api?.events?.onAgentEvent;
+  // `api.runtime.events.onAgentEvent` — the runtime sub-object on
+  // OpenClawPluginApi (see plugins/types.ts:1330). Older shapes that exposed
+  // `api.events` directly are also tolerated; if neither is present the
+  // plugin no-ops the listener and falls back to delivering only the final
+  // reply.
+  const subscribe = api?.runtime?.events?.onAgentEvent ?? api?.events?.onAgentEvent;
   log(`[cot] subscribe-available=${typeof subscribe === "function"} peerSessionKey=${peerSessionKey} session=${String(sessionId).slice(0, 8)}`);
   // Diagnostic counters — logged at done/error so we can tell at a glance
   // whether events are arriving at all, whether the sessionKey filter is
