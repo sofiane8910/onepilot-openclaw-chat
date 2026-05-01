@@ -6,6 +6,7 @@ import { handleUserMessage } from "./messaging.js";
 import { sendOnepilotText } from "./outbound.js";
 import { maybeHandleApproval } from "./approvals.js";
 import { buildBeforeToolCallHook } from "./approvals-gate.js";
+import { buildToolResultPersistHook } from "./approvals-context.js";
 
 // One subscription / channel registration per process — register() can fire
 // multiple times and we need to dedupe to avoid duplicate inserts.
@@ -119,20 +120,32 @@ export default definePluginEntry({
     // OpenClaw's own internal-events hook system (file-watching, runtime
     // persistence, etc.) and silently no-ops for plugin hook names.
     if (typeof api.on === "function") {
+      const gateLog = (m, err) => {
+        if (err) api.logger.warn?.(`[onepilot:gate] ${m}: ${String(err)}`);
+        else api.logger.info?.(`[onepilot:gate] ${m}`);
+      };
       try {
-        const hook = buildBeforeToolCallHook({
+        const beforeHook = buildBeforeToolCallHook({
           accounts,
           lookupSessionId,
           lookupAnySessionForAccount,
-          log: (m, err) => {
-            if (err) api.logger.warn?.(`[onepilot:gate] ${m}: ${String(err)}`);
-            else api.logger.info?.(`[onepilot:gate] ${m}`);
-          },
+          log: gateLog,
         });
-        api.on("before_tool_call", hook);
+        api.on("before_tool_call", beforeHook);
         log("registered before_tool_call hook for approval gate (api.on)");
       } catch (err) {
         warn("api.on(before_tool_call) failed — approval gate inert", err);
+      }
+      try {
+        // Persist hook: prepends an "[Onepilot: approved]" marker to the
+        // tool's result message AFTER the gate let it run. Lets the model
+        // see the gate's existence on its next inference instead of
+        // inspecting upstream config and hallucinating "approvals off".
+        const persistHook = buildToolResultPersistHook({ log: gateLog });
+        api.on("tool_result_persist", persistHook);
+        log("registered tool_result_persist hook for approval marker injection");
+      } catch (err) {
+        warn("api.on(tool_result_persist) failed — marker injection inert", err);
       }
     } else {
       warn("api.on unavailable — OpenClaw too old? approval gate inert");

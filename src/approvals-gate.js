@@ -15,6 +15,7 @@
 import { randomUUID } from "node:crypto";
 import { broadcast } from "./progress.js";
 import { isApprovalsForwardingEnabled } from "./approvals.js";
+import { recordApproval } from "./approvals-context.js";
 
 // Tool-name allowlist for "this is an exec-shaped tool that should ask".
 // Mirrors the upstream allowlist intent without depending on its config.
@@ -151,6 +152,16 @@ export function buildBeforeToolCallHook({ accounts, lookupSessionId, lookupAnySe
     if (decision === "deny") {
       return { block: true, blockReason: "Denied by user" };
     }
+    // Record the approval so the tool_result_persist hook (in
+    // approvals-context.js) can prepend an "[Onepilot: approved]" marker
+    // to the tool's result message. The model then sees the marker on its
+    // next inference and stops hallucinating that approvals are off.
+    recordApproval({
+      sessionKey: ctx?.sessionKey,
+      toolName: event?.toolName,
+      toolCallId: event?.toolCallId,
+      decision,
+    });
     // allow-once and allow-always both proceed. allow-always could be
     // persisted to a per-(agentId, command-pattern) allowlist for future
     // calls; deferred — single-tap UX matters more than power-user feature.
