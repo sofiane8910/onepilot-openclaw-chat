@@ -234,6 +234,16 @@ route("POST", "/onepilot/v1/plugin/uninstall", async (_req, res, _ctx) => {
   send(res, 200, { ok: true });
 });
 
+route("POST", "/onepilot/v1/approvals/config", async (req, res, _ctx) => {
+  const body = await readJson(req);
+  if (typeof body?.enabled !== "boolean") {
+    return send(res, 400, { ok: false, error: "enabled (boolean) required" });
+  }
+  const { setApprovalsForwardingEnabled } = await import("./approvals.js");
+  await setApprovalsForwardingEnabled(body.enabled);
+  send(res, 200, { ok: true, enabled: body.enabled });
+});
+
 function findHandler(method, urlPath) {
   return ROUTES.get(`${method} ${urlPath}`);
 }

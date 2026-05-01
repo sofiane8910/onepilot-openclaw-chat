@@ -4,6 +4,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/core";
 import { startStreamSubscription } from "./stream.js";
 import { handleUserMessage } from "./messaging.js";
 import { sendOnepilotText } from "./outbound.js";
+import { maybeHandleApproval } from "./approvals.js";
 
 // One subscription / channel registration per process — register() can fire
 // multiple times and we need to dedupe to avoid duplicate inserts.
@@ -106,6 +107,10 @@ export default definePluginEntry({
             },
             outbound: {
               deliveryMode: "direct",
+              // sendText is required by the channel adapter contract — without
+              // it deliver.ts treats the channel as "outbound not configured"
+              // (see openclaw/src/infra/outbound/deliver.ts:156). It handles the
+              // plain-text path (regular agent replies, cron deliveries, etc.).
               sendText: (ctx) =>
                 sendOnepilotText({
                   ctx,
@@ -115,6 +120,34 @@ export default definePluginEntry({
                     else api.logger.info?.(`[onepilot:outbound] ${m}`);
                   },
                 }),
+              // sendPayload is invoked instead of sendText when the upstream
+              // ReplyPayload carries `channelData` or `interactive` (see
+              // deliver.ts:675-690). The approval forwarder sets
+              // `channelData.execApproval = { approvalId, approvalSlug,
+              // allowedDecisions }` so iOS users can decide via chat bubble.
+              sendPayload: async (ctx) => {
+                const obLog = (m, err) => {
+                  if (err) api.logger.warn?.(`[onepilot:outbound] ${m}: ${String(err)}`);
+                  else api.logger.info?.(`[onepilot:outbound] ${m}`);
+                };
+                const accountId =
+                  ctx?.accountId ??
+                  ctx?.payload?.accountId ??
+                  Object.keys(accounts)[0];
+                const account = accounts[accountId];
+                if (account) {
+                  try {
+                    const handled = await maybeHandleApproval({ ctx, account, log: obLog });
+                    if (handled) return { ok: true, deliveredAtMs: Date.now() };
+                  } catch (err) {
+                    obLog("approval forwarding failed; falling back to text send", err);
+                  }
+                }
+                // Non-approval rich payload — flatten to text and reuse the
+                // sendText path. sendOnepilotText only reads ctx.text + identity.
+                const flat = { ...ctx, text: ctx?.payload?.text ?? "" };
+                return sendOnepilotText({ ctx: flat, accounts, log: obLog });
+              },
             },
           },
         });
