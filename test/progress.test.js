@@ -3,7 +3,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { broadcast, progressUpsert, progressClear, channelForSession } from "../src/progress.js";
+import { broadcast, progressUpsert, progressFinalize, channelForSession } from "../src/progress.js";
 
 const ACCOUNT = {
   backendUrl: "https://example.test",
@@ -60,7 +60,7 @@ test("broadcast posts to /realtime/v1/api/broadcast with the right topic, event,
   }
 });
 
-test("progressUpsert posts merge-duplicates with lowercase ids", async () => {
+test("progressUpsert posts merge-duplicates with lowercase ids and selected fields", async () => {
   const f = captureFetch();
   try {
     await progressUpsert(
@@ -68,7 +68,7 @@ test("progressUpsert posts merge-duplicates with lowercase ids", async () => {
       SESSION_ID,
       "USER-AAAA",
       "AGENT-BBBB",
-      "trail so far\n",
+      { reasoningText: "trail so far\n", isActive: true, setStartedAt: true },
     );
     assert.equal(f.calls.length, 1);
     const { url, init } = f.calls[0];
@@ -76,28 +76,52 @@ test("progressUpsert posts merge-duplicates with lowercase ids", async () => {
     assert.equal(init.method, "POST");
     assert.equal(init.headers.Prefer, "resolution=merge-duplicates,return=minimal");
     const body = JSON.parse(init.body);
-    assert.deepEqual(body, {
-      session_id: SESSION_ID.toLowerCase(),
-      user_id: "user-aaaa",
-      agent_profile_id: "agent-bbbb",
-      reasoning_text: "trail so far\n",
-    });
+    assert.equal(body.session_id, SESSION_ID.toLowerCase());
+    assert.equal(body.user_id, "user-aaaa");
+    assert.equal(body.agent_profile_id, "agent-bbbb");
+    assert.equal(body.is_active, true);
+    assert.equal(body.reasoning_text, "trail so far\n");
+    assert.ok(body.last_activity_at, "last_activity_at should be set");
+    assert.ok(body.started_at, "started_at should be set when setStartedAt: true");
+    // Fields not passed should NOT be present (so partial updates don't clobber).
+    assert.ok(!("partial_response" in body));
+    assert.ok(!("status_label" in body));
   } finally {
     f.restore();
   }
 });
 
-test("progressClear DELETEs the row by session_id", async () => {
+test("progressUpsert without setStartedAt omits started_at (no clobber)", async () => {
   const f = captureFetch();
   try {
-    await progressClear(ACCOUNT, SESSION_ID);
+    await progressUpsert(
+      ACCOUNT,
+      SESSION_ID,
+      "u",
+      "a",
+      { statusLabel: "Running exec…" },
+    );
+    const body = JSON.parse(f.calls[0].init.body);
+    assert.equal(body.status_label, "Running exec…");
+    assert.ok(!("started_at" in body));
+    assert.ok(!("reasoning_text" in body));
+  } finally {
+    f.restore();
+  }
+});
+
+test("progressFinalize upserts is_active=false (replaces the old DELETE-based clear)", async () => {
+  const f = captureFetch();
+  try {
+    await progressFinalize(ACCOUNT, SESSION_ID, "u", "a");
     assert.equal(f.calls.length, 1);
     const { url, init } = f.calls[0];
-    assert.equal(
-      url,
-      `https://example.test/rest/v1/agent_session_progress?session_id=eq.${SESSION_ID.toLowerCase()}`,
-    );
-    assert.equal(init.method, "DELETE");
+    assert.equal(url, "https://example.test/rest/v1/agent_session_progress");
+    assert.equal(init.method, "POST");
+    const body = JSON.parse(init.body);
+    assert.equal(body.is_active, false);
+    assert.equal(body.partial_response, "");
+    assert.equal(body.status_label, "");
   } finally {
     f.restore();
   }

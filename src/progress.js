@@ -71,26 +71,54 @@ export async function broadcast(account, sessionId, event, payload, log) {
 }
 
 /**
- * UPSERT the in-flight reasoning trail so iOS can recover it on bootstrap if
- * the user reopens the chat mid-thought. PostgREST's resolution=merge-duplicates
- * makes session_id (PK) the conflict target. 4xx (e.g. table missing) is a
- * silent skip — chat still works without it.
+ * UPSERT live agent state to `agent_session_progress` so iOS can rebuild the
+ * full in-flight UI (Lottie spinner, status pill, partial response, reasoning
+ * trail) on bootstrap / app-foreground / conversation-reopen. Realtime
+ * broadcasts are fire-and-forget; this single row is the durable catch-up
+ * snapshot. PostgREST's resolution=merge-duplicates makes session_id (PK) the
+ * conflict target. 4xx (e.g. table missing) is a silent skip — chat still
+ * works without it.
+ *
+ * `fields` is an object with optional keys; only the keys actually present on
+ * the object are written (so partial updates don't clobber columns set by an
+ * earlier upsert). Always bumps `last_activity_at` and `updated_at`.
+ *
+ *   { reasoningText?: string,
+ *     statusLabel?: string,
+ *     partialResponse?: string,
+ *     isActive?: boolean (default true),
+ *     setStartedAt?: boolean (default false) }
  */
 export async function progressUpsert(
   account,
   sessionId,
   userId,
   agentProfileId,
-  reasoningText,
+  fields,
   log,
 ) {
   const url = `${account.backendUrl}/rest/v1/agent_session_progress`;
-  const body = JSON.stringify({
+  const nowIso = new Date().toISOString();
+  const body = {
     session_id: String(sessionId).toLowerCase(),
     user_id: String(userId).toLowerCase(),
     agent_profile_id: String(agentProfileId).toLowerCase(),
-    reasoning_text: reasoningText,
-  });
+    is_active: fields?.isActive ?? true,
+    last_activity_at: nowIso,
+    updated_at: nowIso,
+  };
+  if (fields && Object.prototype.hasOwnProperty.call(fields, "reasoningText")) {
+    body.reasoning_text = fields.reasoningText;
+  }
+  if (fields && Object.prototype.hasOwnProperty.call(fields, "partialResponse")) {
+    body.partial_response = fields.partialResponse;
+  }
+  if (fields && Object.prototype.hasOwnProperty.call(fields, "statusLabel")) {
+    body.status_label = fields.statusLabel;
+  }
+  if (fields?.setStartedAt) {
+    body.started_at = nowIso;
+  }
   try {
     const r = await fetchWithTimeout(
       url,
@@ -102,7 +130,7 @@ export async function progressUpsert(
           Authorization: `Bearer ${account.publishableKey}`,
           Prefer: "resolution=merge-duplicates,return=minimal",
         },
-        body,
+        body: JSON.stringify(body),
       },
       BROADCAST_TIMEOUT_MS,
     );
@@ -116,26 +144,18 @@ export async function progressUpsert(
 }
 
 /**
- * Drop the live progress row on done/error so the iOS hydrate path doesn't
- * resurface a stale trail next time the chat opens.
+ * Mark the live progress row finished (`is_active=false`) and clear transient
+ * fields. The row stays for a short grace window so a client returning right
+ * after `done` can still see the final state; the pg_cron sweep deletes
+ * finalised rows after 5 min. Best-effort — a missing row is fine.
  */
-export async function progressClear(account, sessionId, log) {
-  const url =
-    `${account.backendUrl}/rest/v1/agent_session_progress` +
-    `?session_id=eq.${String(sessionId).toLowerCase()}`;
-  try {
-    await fetchWithTimeout(
-      url,
-      {
-        method: "DELETE",
-        headers: {
-          apikey: account.publishableKey,
-          Authorization: `Bearer ${account.publishableKey}`,
-        },
-      },
-      BROADCAST_TIMEOUT_MS,
-    );
-  } catch (err) {
-    log?.(`progress clear failed (best-effort)`, err);
-  }
+export async function progressFinalize(account, sessionId, userId, agentProfileId, log) {
+  await progressUpsert(
+    account,
+    sessionId,
+    userId,
+    agentProfileId,
+    { isActive: false, statusLabel: "", partialResponse: "" },
+    log,
+  );
 }

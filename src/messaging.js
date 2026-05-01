@@ -1,7 +1,7 @@
 // Run a user message through the gateway, deliver the reply via the backend.
 
 import { getAgentId } from "./env.js";
-import { broadcast, progressUpsert, progressClear } from "./progress.js";
+import { broadcast, progressUpsert, progressFinalize } from "./progress.js";
 
 const HISTORY_LIMIT = 20;
 
@@ -86,12 +86,40 @@ export async function handleUserMessage(params) {
   // never block the canonical assistant ingest path.
   const userIdLc = String(account.userId).toLowerCase();
   const agentProfileIdLc = String(account.agentProfileId).toLowerCase();
+  // Live state mirrors the Hermes plugin (onepilot-hermes-chat/__init__.py).
+  // The row carries everything iOS needs to rebuild the in-flight UI on
+  // app-reopen / scenePhase=.active / conversation-reopen — Lottie spinner,
+  // status pill, partial response, reasoning trail.
   const trail = { text: "" };
+  const partial = { text: "" };
+  const status = { text: "Thinking…" };
   const progressLog = (m, err) => log(err ? `[progress] ${m}: ${String(err)}` : `[progress] ${m}`);
-  const appendTrail = async (line) => {
+  const upsertTrail = async (line) => {
     if (!line || trail.text.endsWith(line)) return;
     trail.text += line;
-    await progressUpsert(account, sessionId, userIdLc, agentProfileIdLc, trail.text, progressLog);
+    await progressUpsert(
+      account, sessionId, userIdLc, agentProfileIdLc,
+      { reasoningText: trail.text, isActive: true },
+      progressLog,
+    );
+  };
+  const upsertStatus = async (next) => {
+    if (!next || next === status.text) return;
+    status.text = next;
+    await progressUpsert(
+      account, sessionId, userIdLc, agentProfileIdLc,
+      { statusLabel: status.text, isActive: true },
+      progressLog,
+    );
+  };
+  const upsertPartial = async (delta) => {
+    if (!delta) return;
+    partial.text += delta;
+    await progressUpsert(
+      account, sessionId, userIdLc, agentProfileIdLc,
+      { partialResponse: partial.text, isActive: true },
+      progressLog,
+    );
   };
   // OpenClawPluginApi exposes the agent-event bus at api.runtime.events
   // (see openclaw plugins/types.ts:1330). If a future shape drops it the
@@ -146,7 +174,7 @@ export async function handleUserMessage(params) {
           if (!text) return;
           void broadcast(account, sessionId, "reasoning_delta", { text }, progressLog);
           lastBroadcastAt = Date.now();
-          void appendTrail(text);
+          void upsertTrail(text);
         } else if (evt.stream === "tool") {
           counters.tool++;
           const data = evt.data ?? {};
@@ -163,7 +191,8 @@ export async function handleUserMessage(params) {
             : buildToolLabel(name, data.args);
           void broadcast(account, sessionId, "tool_progress", { tool: name, emoji, label }, progressLog);
           lastBroadcastAt = Date.now();
-          void appendTrail(`${emoji} ${label}\n`);
+          void upsertTrail(`${emoji} ${label}\n`);
+          void upsertStatus(name ? `Running ${name}…` : (label || "Working…"));
         } else {
           counters.other++;
         }
@@ -172,6 +201,20 @@ export async function handleUserMessage(params) {
 
   await broadcast(account, sessionId, "started", {}, progressLog);
   lastBroadcastAt = Date.now();
+  // Seed the live state row so iOS can render the Lottie + status pill
+  // even before the first reasoning/tool event arrives. Subsequent
+  // upserts merge-duplicate on session_id (the PK).
+  await progressUpsert(
+    account, sessionId, userIdLc, agentProfileIdLc,
+    {
+      reasoningText: "",
+      partialResponse: "",
+      statusLabel: status.text,
+      isActive: true,
+      setStartedAt: true,
+    },
+    progressLog,
+  );
 
   // Heartbeat: when the agent is alive (lastAgentEventAt is recent) but
   // we haven't broadcast anything to iOS in a while, fire an empty
@@ -206,7 +249,7 @@ export async function handleUserMessage(params) {
     } else {
       await broadcast(account, sessionId, "done", {}, progressLog);
     }
-    await progressClear(account, sessionId, progressLog);
+    await progressFinalize(account, sessionId, userIdLc, agentProfileIdLc, progressLog);
   };
 
   try {
@@ -238,7 +281,13 @@ export async function handleUserMessage(params) {
         await finalize("error", errMsg);
         return;
       }
-      reply = await readSseAssistantText(res, log);
+      reply = await readSseAssistantText(res, log, (delta) => {
+        // Forward visible content as it streams so iOS can rebuild the
+        // partial-response bubble after a disconnect. The final assistant
+        // INSERT still lands via the canonical ingest path; this is purely
+        // the in-flight snapshot.
+        void upsertPartial(delta);
+      });
     } catch (err) {
       log(`gateway call failed`, err);
       await finalize("error", `gateway call failed: ${String(err?.message ?? err)}`);
@@ -385,7 +434,7 @@ function extractText(content) {
   return "";
 }
 
-async function readSseAssistantText(res, log) {
+async function readSseAssistantText(res, log, onDelta) {
   const decoder = new TextDecoder();
   let buf = "";
   let acc = "";
@@ -401,7 +450,12 @@ async function readSseAssistantText(res, log) {
       try {
         const j = JSON.parse(payload);
         const delta = j?.choices?.[0]?.delta?.content;
-        if (typeof delta === "string") acc += delta;
+        if (typeof delta === "string" && delta) {
+          acc += delta;
+          if (typeof onDelta === "function") {
+            try { onDelta(delta); } catch { /* best-effort */ }
+          }
+        }
       } catch (err) {
         log(`sse parse error (skipping line): ${err?.message ?? err}`);
       }
