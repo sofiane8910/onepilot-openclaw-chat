@@ -5,11 +5,44 @@ import { startStreamSubscription } from "./stream.js";
 import { handleUserMessage } from "./messaging.js";
 import { sendOnepilotText } from "./outbound.js";
 import { maybeHandleApproval } from "./approvals.js";
+import { buildBeforeToolCallHook } from "./approvals-gate.js";
 
 // One subscription / channel registration per process — register() can fire
 // multiple times and we need to dedupe to avoid duplicate inserts.
 const _activeSubscriptions = new Map();
 let _channelRegistered = false;
+
+// Per-account map: sessionKey -> sessionId (Supabase row UUID). Updated on
+// every inbound user-message row. Approval forwarding reads from this map
+// because the channel outbound `ctx` exposes `to: <sessionKey>` only — it
+// has no idea about Supabase row UUIDs. Without this lookup, the broadcast
+// would land on `messages_<sessionKey>` and iOS (subscribed to
+// `messages_<sessionId-UUID>`) would never receive it.
+const _sessionIdBySessionKey = new Map(); // accountId -> Map<sessionKey, sessionId>
+export function rememberSessionId(accountId, sessionKey, sessionId) {
+  if (!accountId || !sessionKey || !sessionId) return;
+  let inner = _sessionIdBySessionKey.get(accountId);
+  if (!inner) { inner = new Map(); _sessionIdBySessionKey.set(accountId, inner); }
+  inner.set(String(sessionKey), String(sessionId));
+}
+export function lookupSessionId(accountId, sessionKey) {
+  return _sessionIdBySessionKey.get(accountId)?.get(String(sessionKey)) ?? null;
+}
+/**
+ * Fallback for the approval gate: when the hook's sessionKey doesn't map
+ * to any cached entry (e.g. the hook gives an agent-internal sessionKey
+ * shape that the chat side never sees), return any cached sessionId for
+ * the account so the broadcast still lands on a channel iOS is listening
+ * to. Maps insert in order; we return the most recently inserted.
+ */
+export function lookupAnySessionForAccount(accountId) {
+  const inner = _sessionIdBySessionKey.get(accountId);
+  if (!inner || inner.size === 0) return null;
+  // Map iteration is insertion order; .values() iterates from oldest. We
+  // want most recent — convert to array and pop. Cheap (cache is tiny).
+  const arr = Array.from(inner.values());
+  return arr[arr.length - 1] ?? null;
+}
 
 async function runCatchUp({ account, agentProfileIdLc, sinceMs, log, dispatch }) {
   try {
@@ -77,6 +110,34 @@ export default definePluginEntry({
       );
     }
 
+    // Approval gate: before any execution-shaped tool runs, broadcast the
+    // request to iOS and wait for a `/approve <id> <decision>` reply. We
+    // own the gate end-to-end (no upstream exec-approvals dependency, no
+    // operator.approvals scope needed). See approvals-gate.js for why.
+    // Plugin hooks (typed lifecycle events like `before_tool_call`) are
+    // registered via api.on(), NOT api.registerHook() — the latter is for
+    // OpenClaw's own internal-events hook system (file-watching, runtime
+    // persistence, etc.) and silently no-ops for plugin hook names.
+    if (typeof api.on === "function") {
+      try {
+        const hook = buildBeforeToolCallHook({
+          accounts,
+          lookupSessionId,
+          lookupAnySessionForAccount,
+          log: (m, err) => {
+            if (err) api.logger.warn?.(`[onepilot:gate] ${m}: ${String(err)}`);
+            else api.logger.info?.(`[onepilot:gate] ${m}`);
+          },
+        });
+        api.on("before_tool_call", hook);
+        log("registered before_tool_call hook for approval gate (api.on)");
+      } catch (err) {
+        warn("api.on(before_tool_call) failed — approval gate inert", err);
+      }
+    } else {
+      warn("api.on unavailable — OpenClaw too old? approval gate inert");
+    }
+
     if (!_channelRegistered && typeof api.registerChannel === "function") {
       try {
         const readAccounts = (cfg) =>
@@ -137,7 +198,36 @@ export default definePluginEntry({
                 const account = accounts[accountId];
                 if (account) {
                   try {
-                    const handled = await maybeHandleApproval({ ctx, account, log: obLog });
+                    const handled = await maybeHandleApproval({
+                      ctx,
+                      account,
+                      log: obLog,
+                      lookupSessionId,
+                      fetchLatestSessionId: async (acc, sessionKey) => {
+                        // Cold-start fallback: ask the backend for the most
+                        // recent message row matching this user/agent/sessionKey
+                        // and use its session_id. PostgREST fetch via the
+                        // existing publishableKey (no agent key auth needed
+                        // because RLS allows the row owner to read).
+                        const url = `${acc.backendUrl}/rest/v1/messages?select=session_id&user_id=eq.${encodeURIComponent(acc.userId)}&agent_profile_id=eq.${encodeURIComponent(acc.agentProfileId)}&session_key=eq.${encodeURIComponent(sessionKey)}&order=created_at.desc&limit=1`;
+                        try {
+                          const res = await fetch(url, {
+                            headers: {
+                              apikey: acc.publishableKey,
+                              Authorization: `Bearer ${acc.agentKey}`,
+                            },
+                          });
+                          if (!res.ok) return null;
+                          const rows = await res.json();
+                          const sid = Array.isArray(rows) && rows[0]?.session_id;
+                          if (sid) {
+                            rememberSessionId(accountId, sessionKey, sid);
+                            return sid;
+                          }
+                        } catch {}
+                        return null;
+                      },
+                    });
                     if (handled) return { ok: true, deliveredAtMs: Date.now() };
                   } catch (err) {
                     obLog("approval forwarding failed; falling back to text send", err);
@@ -222,6 +312,11 @@ export default definePluginEntry({
           }
           const ts = row.created_at ? Date.parse(row.created_at) : 0;
           if (Number.isFinite(ts) && ts > lastSeenUserAt) lastSeenUserAt = ts;
+          // Cache the sessionKey → sessionId mapping so approval forwarding
+          // can broadcast on the channel iOS is actually subscribed to.
+          if (row.session_key && row.session_id) {
+            rememberSessionId(accountId, row.session_key, row.session_id);
+          }
           log(
             `[${accountId}] user message id=${String(row.id ?? "").slice(0, 8)} ` +
               `session=${row.session_key ?? "?"} — dispatching to agent`,
@@ -253,6 +348,13 @@ export default definePluginEntry({
             dispatch: (row) => {
               const ts = row.created_at ? Date.parse(row.created_at) : 0;
               if (Number.isFinite(ts) && ts > lastSeenUserAt) lastSeenUserAt = ts;
+              // Populate the cache even for catchup rows. Catchup is how the
+              // mapping is recovered after a gateway restart or fresh subscribe;
+              // without this, approval forwarding falls back to the REST query
+              // for every approval until the user types a fresh live message.
+              if (row.session_key && row.session_id) {
+                rememberSessionId(accountId, row.session_key, row.session_id);
+              }
               void handleUserMessage({
                 api,
                 accountId,

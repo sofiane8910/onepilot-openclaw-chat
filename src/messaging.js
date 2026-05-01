@@ -36,11 +36,81 @@ const HEARTBEAT_LIVENESS_WINDOW_MS = 20_000;
  *   log: (msg: string, err?: unknown) => void,
  * }} params
  */
+// Match `/approve <id> <decision>` regardless of leading/trailing whitespace.
+// `id` accepts UUIDs, short codes (8-char prefix), and any token shape the
+// upstream lookupPendingId knows how to resolve.
+const APPROVE_REGEX = /^\s*\/approve\s+([\w-]+)\s+(allow-once|allow-always|deny)\b/i;
+
+async function maybeHandleApproveCommand({ account, userMessageRow, gatewayPort, gatewayToken, log }) {
+  const text = (function extract(c) {
+    if (typeof c === "string") {
+      try { return extract(JSON.parse(c)); } catch { return c; }
+    }
+    if (Array.isArray(c)) {
+      const part = c.find((p) => p && (p.type === "text" || !p.type) && typeof p.text === "string");
+      return part?.text ?? "";
+    }
+    if (c && typeof c === "object" && typeof c.text === "string") return c.text;
+    return "";
+  })(userMessageRow.content);
+
+  const m = APPROVE_REGEX.exec(text || "");
+  if (!m) return false;
+  const approvalId = m[1];
+  const decision = m[2].toLowerCase();
+
+  log(`/approve detected: id=${approvalId.slice(0, 8)} decision=${decision} — resolving via in-memory gate`);
+
+  // Approval gate is in approvals-gate.js. Resolution unblocks the awaiting
+  // promise registered by the before_tool_call hook.
+  const { applyDecision } = await import("./approvals-gate.js");
+  const matched = applyDecision(approvalId, decision);
+  const resultText = matched
+    ? `✅ Approval ${decision} submitted for \`${approvalId.slice(0, 8)}\`.`
+    : `⚠️ Approval \`${approvalId.slice(0, 8)}\` was already resolved or expired.`;
+  log(`/approve ${matched ? "matched and resolved" : "no pending entry"}`);
+
+  // Post the confirmation as an assistant reply so the user sees feedback in chat.
+  const userIdLc = String(account.userId).toLowerCase();
+  const agentProfileIdLc = String(account.agentProfileId).toLowerCase();
+  try {
+    const url = `${account.backendUrl}/functions/v1/agent-message-ingest`;
+    const body = JSON.stringify({
+      userId: userIdLc,
+      agentProfileId: agentProfileIdLc,
+      sessionKey: userMessageRow.session_key ?? account.sessionKey,
+      role: "assistant",
+      content: [{ type: "text", text: resultText }],
+      timestamp: Date.now(),
+    });
+    await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${account.agentKey}`,
+      },
+      body,
+    });
+  } catch (err) {
+    log(`/approve confirmation post failed`, err);
+  }
+  return true;
+}
+
 export async function handleUserMessage(params) {
   const { api, accountId, account, userMessageRow, gatewayPort, gatewayToken, log } = params;
   const sessionId = userMessageRow.session_id;
   if (!sessionId) {
     log(`user row missing session_id, skipping`);
+    return;
+  }
+
+  // Intercept `/approve <id> <decision>` before dispatching to the model.
+  // Without this, OpenClaw's auto-reply pipeline never runs (we go directly
+  // to /v1/chat/completions which bypasses commands-approve.ts) and the
+  // model treats the approval text as a regular question. Resolves via
+  // `exec.approval.resolve` JSON-RPC against the local gateway.
+  if (await maybeHandleApproveCommand({ account, userMessageRow, gatewayPort, gatewayToken, log })) {
     return;
   }
 

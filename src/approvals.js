@@ -51,38 +51,10 @@ function resolveConfigPath() {
   return path.join(stateDir, "openclaw.json");
 }
 
-/**
- * Patch object the iOS toggle wants whenever it's ON. Captures all three
- * upstream surfaces:
- *   - tools.exec.security: "allowlist"  → only allowlisted commands run silent
- *   - tools.exec.ask:      "always"     → everything else asks the user
- *   - approvals.exec.{enabled,mode,targets} → forwarder routes through onepilot
- *
- * The values pre-existing in the user's config are saved to BACKUP_FILE on
- * the first ON-toggle so OFF restores them rather than guessing defaults.
- */
-const APPROVALS_ON_PATCH = {
-  tools: { exec: { security: "allowlist", ask: "always" } },
-  approvals: {
-    exec: {
-      enabled: true,
-      mode: "targets",
-      targets: [{ channel: "onepilot", to: "main" }],
-    },
-  },
-};
-
-async function readJsonOrEmpty(p) {
-  try {
-    return JSON.parse(await fs.readFile(p, "utf8"));
-  } catch {
-    return {};
-  }
-}
-
-function getDeep(obj, dottedPath) {
-  return dottedPath.split(".").reduce((cur, k) => (cur == null ? undefined : cur[k]), obj);
-}
+// Pre-v0.9 migration helpers. Approvals are now enforced by the plugin's
+// `before_tool_call` hook (see approvals-gate.js); upstream openclaw.json is
+// no longer touched. Helpers below only run on hosts that still have a
+// backup file from the old approach.
 
 function setDeep(obj, dottedPath, value) {
   const keys = dottedPath.split(".");
@@ -102,82 +74,51 @@ const TRACKED_PATHS = [
   "approvals.exec.targets",
 ];
 
-async function applyOpenClawConfigForToggle(enabled, log) {
+/**
+ * One-time migration: pre-v0.9 versions of this plugin patched
+ * tools.exec.* + approvals.exec.* into openclaw.json on toggle ON. v0.9
+ * dropped that approach (we own the gate via before_tool_call). On hosts
+ * upgrading from v0.5–v0.8, restore the saved-pre-toggle values from
+ * BACKUP_FILE so the user's openclaw.json returns to the state it was in
+ * before they ever turned approvals on. Idempotent — no-op when no
+ * backup file exists.
+ */
+async function migratePreV09Config(log) {
+  let backup;
+  try {
+    backup = JSON.parse(await fs.readFile(BACKUP_FILE, "utf8"));
+  } catch {
+    return; // no migration needed
+  }
+  if (!backup || typeof backup !== "object") return;
+
   const cfgPath = resolveConfigPath();
   let cfg;
   try {
     cfg = JSON.parse(await fs.readFile(cfgPath, "utf8"));
-  } catch (err) {
-    log?.(`config read failed at ${cfgPath} — skipping config patch`, err);
-    return false;
+  } catch {
+    return;
   }
-
-  if (enabled) {
-    // First time enabling — capture original values for clean rollback.
-    try {
-      await fs.access(BACKUP_FILE);
-      // Backup already exists; don't overwrite (toggle was on previously).
-    } catch {
-      const backup = {};
-      for (const p of TRACKED_PATHS) {
-        const v = getDeep(cfg, p);
-        if (v !== undefined) backup[p] = v;
-      }
-      await fs.mkdir(path.dirname(BACKUP_FILE), { recursive: true }).catch(() => {});
-      await fs.writeFile(BACKUP_FILE, JSON.stringify(backup, null, 2), "utf8");
-      log?.(`captured config backup with ${Object.keys(backup).length} keys`);
-    }
-
-    // Apply the ON patch.
-    setDeep(cfg, "tools.exec.security", APPROVALS_ON_PATCH.tools.exec.security);
-    setDeep(cfg, "tools.exec.ask", APPROVALS_ON_PATCH.tools.exec.ask);
-    setDeep(cfg, "approvals.exec.enabled", true);
-    setDeep(cfg, "approvals.exec.mode", "targets");
-    setDeep(cfg, "approvals.exec.targets", [{ channel: "onepilot", to: "main" }]);
-  } else {
-    // Restore from backup. An empty backup ({}) means none of the tracked
-    // keys existed before we toggled ON, so we should remove ALL of them
-    // for a pristine OFF state. A populated backup restores each saved
-    // value and removes any key that wasn't in the original. Either way
-    // the backup file is consumed (deleted) so the next ON re-captures.
-    let backup = null;
-    try {
-      backup = JSON.parse(await fs.readFile(BACKUP_FILE, "utf8"));
-    } catch {
-      backup = null;
-    }
-    if (backup === null) {
-      // No backup at all (e.g. someone deleted the file). Most conservative
-      // option: just turn forwarding off, leave the rest as-is.
-      setDeep(cfg, "approvals.exec.enabled", false);
+  for (const p of TRACKED_PATHS) {
+    if (Object.prototype.hasOwnProperty.call(backup, p)) {
+      setDeep(cfg, p, backup[p]);
     } else {
-      for (const p of TRACKED_PATHS) {
-        if (Object.prototype.hasOwnProperty.call(backup, p)) {
-          setDeep(cfg, p, backup[p]);
-        } else {
-          // Wasn't in original config — delete the key we added.
-          const keys = p.split(".");
-          let cur = cfg;
-          for (let i = 0; i < keys.length - 1; i++) cur = cur?.[keys[i]];
-          if (cur && typeof cur === "object") delete cur[keys[keys.length - 1]];
-        }
-      }
-      // Prune empty parents (e.g. tools.exec became {}).
-      if (cfg?.tools?.exec && Object.keys(cfg.tools.exec).length === 0) delete cfg.tools.exec;
-      if (cfg?.tools && Object.keys(cfg.tools).length === 0) delete cfg.tools;
-      if (cfg?.approvals?.exec && Object.keys(cfg.approvals.exec).length === 0) delete cfg.approvals.exec;
-      if (cfg?.approvals && Object.keys(cfg.approvals).length === 0) delete cfg.approvals;
-      await fs.unlink(BACKUP_FILE).catch(() => {});
-      log?.("restored config from backup");
+      const keys = p.split(".");
+      let cur = cfg;
+      for (let i = 0; i < keys.length - 1; i++) cur = cur?.[keys[i]];
+      if (cur && typeof cur === "object") delete cur[keys[keys.length - 1]];
     }
   }
+  if (cfg?.tools?.exec && Object.keys(cfg.tools.exec).length === 0) delete cfg.tools.exec;
+  if (cfg?.tools && Object.keys(cfg.tools).length === 0) delete cfg.tools;
+  if (cfg?.approvals?.exec && Object.keys(cfg.approvals.exec).length === 0) delete cfg.approvals.exec;
+  if (cfg?.approvals && Object.keys(cfg.approvals).length === 0) delete cfg.approvals;
 
-  // Atomic write: tmp + rename.
   const tmp = cfgPath + ".tmp";
   await fs.writeFile(tmp, JSON.stringify(cfg, null, 2), "utf8");
   await fs.rename(tmp, cfgPath);
-  log?.(`patched ${cfgPath} (enabled=${enabled})`);
-  return true;
+  await fs.unlink(BACKUP_FILE).catch(() => {});
+  log?.("migrated: restored pre-v0.9 openclaw.json from backup");
 }
 
 /**
@@ -202,11 +143,10 @@ export async function setApprovalsForwardingEnabled(enabled, opts = {}) {
   } else {
     await fs.unlink(ENABLED_FLAG_FILE).catch(() => {});
   }
-  // Patch the OpenClaw config so the upstream actually demands approvals
-  // (or restores the user's previous policy on OFF). Forwarder reads config
-  // fresh on each request — no gateway restart required.
-  await applyOpenClawConfigForToggle(enabled, opts.log).catch((err) => {
-    opts.log?.(`config patch failed (toggle still recorded in flag file)`, err);
+  // One-shot upgrade migration from pre-v0.9 hosts that had openclaw.json
+  // patched. Pure no-op when no backup file is present.
+  await migratePreV09Config(opts.log).catch((err) => {
+    opts.log?.(`pre-v0.9 migration failed (toggle still recorded in flag file)`, err);
   });
 }
 
@@ -228,8 +168,13 @@ export function extractApproval(ctx) {
  * Channel outbound hook. Returns true if the payload was an approval and
  * we handled it (caller MUST NOT forward as a regular text message).
  * Returns false to let the regular sendOnepilotText path run.
+ *
+ * `lookupSessionId(accountId, sessionKey)` is injected by the caller to
+ * resolve the Supabase session UUID from the upstream `to` (sessionKey).
+ * Required because the outbound ctx only exposes `to: <sessionKey>` while
+ * iOS subscribes to `messages_<sessionId-UUID-prefix>`.
  */
-export async function maybeHandleApproval({ ctx, account, log }) {
+export async function maybeHandleApproval({ ctx, account, log, lookupSessionId, fetchLatestSessionId }) {
   const approval = extractApproval(ctx);
   if (!approval) return false;
   const enabled = await isApprovalsForwardingEnabled();
@@ -238,11 +183,28 @@ export async function maybeHandleApproval({ ctx, account, log }) {
     return true;
   }
 
-  const sessionId =
-    ctx?.sessionId ||
-    ctx?.session_id ||
-    ctx?.payload?.sessionId ||
-    "main";
+  // Resolve the Supabase session UUID. Cache hit (recent inbound user
+  // message) is the hot path. Cold start fallback queries Supabase for the
+  // most recent session row matching this account. Last-resort: skip the
+  // broadcast (we'd land on the wrong channel anyway).
+  const sessionKey = ctx?.to || ctx?.payload?.sessionKey || account?.sessionKey || "main";
+  const accountId =
+    ctx?.accountId ||
+    ctx?.payload?.accountId ||
+    account?.accountId ||
+    "default";
+
+  let sessionId = null;
+  if (typeof lookupSessionId === "function") {
+    sessionId = lookupSessionId(accountId, sessionKey);
+  }
+  if (!sessionId && typeof fetchLatestSessionId === "function") {
+    try { sessionId = await fetchLatestSessionId(account, sessionKey); } catch {}
+  }
+  if (!sessionId) {
+    log?.(`approval ${String(approval.approvalId).slice(0, 8)}: no sessionId for sessionKey="${sessionKey}" — skipping broadcast (iOS won't receive). Open chat in iOS first or send any message to populate the cache.`);
+    return true; // still return true so the upstream doesn't fall back to plain text
+  }
 
   const text = ctx?.payload?.text || ctx?.message?.text || "";
 
@@ -266,7 +228,13 @@ export async function maybeHandleApproval({ ctx, account, log }) {
       : ["allow-once", "allow-always", "deny"],
   };
 
+  // Verbose log so we can diagnose why iOS isn't receiving. Shows the exact
+  // channel topic the broadcast goes to — must match `messages_<UUID-prefix>`
+  // that iOS computed via Foundation UUID.uuidString.prefix(8).
+  const { channelForSession } = await import("./progress.js");
+  const topic = channelForSession(sessionId);
+  log?.(`approval ${body.approval_id.slice(0, 8)}: sessionKey="${sessionKey}" → sessionId=${String(sessionId).slice(0, 8)} → topic="${topic}"`);
   await broadcast(account, sessionId, "approval_requested", body, log);
-  log?.(`forwarded approval_requested id=${body.approval_id.slice(0, 8)}`);
+  log?.(`forwarded approval_requested id=${body.approval_id.slice(0, 8)} topic=${topic}`);
   return true;
 }
